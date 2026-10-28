@@ -1,4 +1,4 @@
-# BtSTweaks 0.3.0
+# BtSTweaks 1.0.0
 
 Graphics and HDR add-on for **Life is Strange: Before the Storm Remastered** (PC, Steam), for
 ReShade with add-on support. Raises the game's graphics beyond its menu and turns its SDR picture
