@@ -138,3 +138,19 @@ looked good in testing (contact shadows under cars, bushes and the trailer outdo
 
 Writes go to the profile objects (shared assets, in memory only). Each written field keeps the
 game's value, and the objects written to are held with GC handles so their addresses stay valid.
+
+## Camera effects
+
+Same profile models, switched off through `m_Enabled` (each kept like the other options, so a
+story script's change becomes the new game value): depth of field (on, kernel Small, focus 4.2,
+f/5.6), chromatic aberration (on, 0.1), vignette (on, 0.26), colour strokes (on: the soft
+coloured light leaks), and bloom's `lensDirt.intensity` (3) set to 0 with the bloom kept. The
+game's scripts drive chromatic aberration and the vignette (`SetMainCameraChromaticAberration`,
+`SetMainCameraVignetting`); the switches remove those moments too. All worked in cutscenes and
+in play (tested 2026-10-28).
+
+The profile has no grain model (the code for `GrainModel` exists, unused). Film grain goes through
+`Behaviour.enabled` on any Standard Assets `NoiseAndGrain` / `NoiseAndScratches` on a camera.
+
+Motion blur (the profile's model, off in the game) was tried as an option and dropped at the
+player's request.

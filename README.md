@@ -1,4 +1,4 @@
-# BtSTweaks 0.2.0
+# BtSTweaks 0.3.0
 
 Graphics and HDR add-on for **Life is Strange: Before the Storm Remastered** (PC, Steam), for
 ReShade with add-on support. Raises the game's graphics beyond its menu and turns its SDR picture
@@ -17,7 +17,11 @@ into HDR that keeps the game's colour grade, live, from an in-game overlay.
   in every scene (the game: 10 samples at half resolution, off in many scenes); **Sharper
   reflections** where a scene has screen-space reflections; **Temporal anti-aliasing** instead of
   FXAA; **High-resolution sun shafts**.
-- **F8** switches every graphics and effects option off and on, to compare.
+- **Camera**: switches that turn off **depth of field**, **chromatic aberration**, the
+  **vignette**, bloom's **lens dirt**, the game's soft coloured **light leaks** and any **film
+  grain** effect on the camera. Unticked, the game decides, scene by scene.
+- **F8** switches every Graphics, Effects and Camera option off and on, to compare.
+- The overlay has tabs: Graphics, Effects, Camera, HDR and Advanced.
 - **Advanced**: HDR status and debug views, a one-frame draw log, the main-thread hook's status,
   and read-only dumps of Unity's quality settings, the live camera and effect objects, and the
   game's settings classes.
@@ -37,7 +41,8 @@ the uncapped cost isn't measured.
 
 Settings are saved in `ReShade.ini` under `[BtSTweaks]` (`Hdr`, `HdrPeak`, `HdrPaperWhite`,
 `HdrHighlightStart`, `Anisotropic`, `ShadowDistance`, `LodBias`, `SunShadow`, `Ao`, `Ssr`, `Taa`,
-`SunShaftsHigh`, `ShowWindow`). Log: `BtSTweaks.log` next to the game's exe.
+`SunShaftsHigh`, `NoDepthOfField`, `NoChromaticAberration`, `NoVignette`, `NoLensDirt`,
+`NoLightLeaks`, `NoFilmGrain`, `ShowWindow`). Log: `BtSTweaks.log` next to the game's exe.
 
 ## Build
 

@@ -116,6 +116,9 @@ struct Offsets {
     int ssrQuality = -1;                                      // ScreenSpaceReflectionModel
     int aaMethod = -1;                                        // AntialiasingModel
     int shaftsResolution = -1;                                // SunShafts.resolution
+    // Camera effects (models in the profile) and bloom's lens dirt intensity.
+    int dof = -1, ca = -1, vignette = -1, bloom = -1, strokes = -1, motionBlur = -1;
+    int lensDirt = -1;                                        // BloomModel m_Settings.lensDirt.intensity
 };
 inline Offsets g_off;
 
@@ -124,9 +127,34 @@ struct Live {
     void* behaviourClass = nullptr;
     void* shaftsClass = nullptr;
     std::vector<std::pair<uint32_t, void*>> behaviours, shafts;
+    // Legacy grain effects that may sit on a camera (Standard Assets image effects).
+    void* grainClasses[2] = {nullptr, nullptr};  // NoiseAndGrain, NoiseAndScratches
+    std::vector<std::pair<uint32_t, void*>> grain[2];
     int countdown = 0;
 };
 inline Live g_live;
+
+// Behaviour.enabled through Unity's internal calls, with the game's value kept like a Slot.
+struct EnabledSlot {
+    uint32_t handle = 0;
+    bool original = true;
+    int lastSet = -1;
+};
+inline std::map<void*, EnabledSlot> g_enabledSlots;
+
+inline void ApplyEnabled(void* obj, bool active, bool want) {
+    static auto get = reinterpret_cast<bool (*)(void*)>(il2cpp_main::Icall("UnityEngine.Behaviour::get_enabled()"));
+    static auto set = reinterpret_cast<void (*)(void*, bool)>(il2cpp_main::Icall("UnityEngine.Behaviour::set_enabled(System.Boolean)"));
+    if (!obj || !get || !set) return;
+    auto [it, fresh] = g_enabledSlots.try_emplace(obj);
+    EnabledSlot& s = it->second;
+    if (fresh) s.handle = g_api.gchandle_new(obj, false);
+    const bool v = get(obj);
+    if (static_cast<int>(v) != s.lastSet) s.original = v;
+    const bool target = active ? want : s.original;
+    if (v != target) set(obj, target);
+    s.lastSet = target;
+}
 
 inline void Refresh(void* klass, std::vector<std::pair<uint32_t, void*>>& list) {
     for (auto& [h, o] : list) g_api.gchandle_free(h);
@@ -147,6 +175,8 @@ struct Wanted {
     int ssr;          // 0 game, 1 full resolution where the game uses it (never turned on)
     bool taa;         // TAA instead of the game's FXAA
     bool shaftsHigh;  // full-resolution sun shafts
+    // Camera effects: switch off (the game's value otherwise).
+    bool dofOff, caOff, vignetteOff, dirtOff, strokesOff, grainOff;
 };
 
 // Called each frame on the main thread. Returns false if the classes aren't there.
@@ -159,6 +189,8 @@ inline bool Update(const Wanted& w, std::string* status) {
         HMODULE m = GetModuleHandleW(L"GameAssembly.dll");
         g_live.behaviourClass = il2cpp_main::FindClass(m, "Assembly-CSharp.dll", "PostProcessingBehaviour");
         g_live.shaftsClass = il2cpp_main::FindClass(m, "Assembly-CSharp.dll", "SunShafts");
+        g_live.grainClasses[0] = il2cpp_main::FindClass(m, "Assembly-CSharp.dll", "NoiseAndGrain");
+        g_live.grainClasses[1] = il2cpp_main::FindClass(m, "Assembly-CSharp.dll", "NoiseAndScratches");
         if (!g_live.behaviourClass) {
             *status = "PostProcessingBehaviour not found";
             return false;
@@ -168,10 +200,12 @@ inline bool Update(const Wanted& w, std::string* status) {
         g_live.countdown = 30;
         Refresh(g_live.behaviourClass, g_live.behaviours);
         Refresh(g_live.shaftsClass, g_live.shafts);
+        for (int i = 0; i < 2; ++i) Refresh(g_live.grainClasses[i], g_live.grain[i]);
     }
 
     int profiles = 0;
     char now[128] = "";  // the first profile's values after applying, read back
+    char cam[160] = "";
     for (auto& [h, b] : g_live.behaviours) {
         if (!g_off.resolved) {
             g_off.resolved = true;
@@ -187,6 +221,12 @@ inline bool Update(const Wanted& w, std::string* status) {
             g_off.ao = PathOffset(pk, "ambientOcclusion");
             g_off.ssr = PathOffset(pk, "screenSpaceReflection");
             g_off.aa = PathOffset(pk, "antialiasing");
+            g_off.dof = PathOffset(pk, "depthOfField");
+            g_off.ca = PathOffset(pk, "chromaticAberration");
+            g_off.vignette = PathOffset(pk, "vignette");
+            g_off.bloom = PathOffset(pk, "bloom");
+            g_off.strokes = PathOffset(pk, "colorStrokes");
+            g_off.motionBlur = PathOffset(pk, "motionBlur");
         }
         auto model = [&](int off) -> void* {
             return off < 0 ? nullptr : *reinterpret_cast<void**>(static_cast<char*>(profile) + off);
@@ -209,6 +249,26 @@ inline bool Update(const Wanted& w, std::string* status) {
         Apply(ao, g_off.aoDownsampling, 1, aoOn, 0);      // full resolution
         Apply(ssr, g_off.ssrQuality, 4, ssrOn, 0);        // SSRResolution.High
         Apply(aa, g_off.aaMethod, 4, w.on && w.taa, 1);   // Method.Taa
+
+        void* dof = model(g_off.dof);
+        void* ca = model(g_off.ca);
+        void* vignette = model(g_off.vignette);
+        void* bloom = model(g_off.bloom);
+        void* strokes = model(g_off.strokes);
+        void* motionBlur = model(g_off.motionBlur);
+        if (bloom && g_off.lensDirt < 0) g_off.lensDirt = PathOffset(g_api.object_get_class(bloom), "m_Settings.lensDirt.intensity");
+        Apply(dof, g_off.enabled, 1, w.on && w.dofOff, 0);
+        Apply(ca, g_off.enabled, 1, w.on && w.caOff, 0);
+        Apply(vignette, g_off.enabled, 1, w.on && w.vignetteOff, 0);
+        Apply(bloom, g_off.lensDirt, 4, w.on && w.dirtOff, 0);  // float 0.0 (all bits zero)
+        Apply(strokes, g_off.enabled, 1, w.on && w.strokesOff, 0);
+        if (!cam[0] && dof && ca && vignette && strokes && motionBlur) {
+            auto on = [](void* o) { return Read(static_cast<char*>(o) + g_off.enabled, 1) ? "on" : "off"; };
+            float dirt = 0;
+            if (bloom && g_off.lensDirt >= 0) memcpy(&dirt, static_cast<char*>(bloom) + g_off.lensDirt, 4);
+            snprintf(cam, sizeof cam, "DoF %s, CA %s, vignette %s, lens dirt %g, light leaks %s, motion blur %s", on(dof),
+                     on(ca), on(vignette), dirt, on(strokes), on(motionBlur));
+        }
         if (!now[0] && ao && ssr && aa) {
             auto rd = [](void* o, int off, int size) { return off < 0 ? -1 : Read(static_cast<char*>(o) + off, size); };
             snprintf(now, sizeof now, "AO %s %d samples%s, SSR %s %s, AA %s",
@@ -221,12 +281,18 @@ inline bool Update(const Wanted& w, std::string* status) {
         if (g_off.shaftsResolution < 0) g_off.shaftsResolution = PathOffset(g_api.object_get_class(s), "resolution");
         Apply(s, g_off.shaftsResolution, 4, w.on && w.shaftsHigh, 2);  // SunShaftsResolution.High
     }
+    size_t grain = 0;
+    for (auto& list : g_live.grain) {
+        grain += list.size();
+        for (auto& [h, g] : list) ApplyEnabled(g, w.on && w.grainOff, false);
+    }
     int shafts = -1;
     if (!g_live.shafts.empty() && g_off.shaftsResolution >= 0)
         shafts = Read(static_cast<char*>(g_live.shafts[0].second) + g_off.shaftsResolution, 4);
-    char b[256];
-    snprintf(b, sizeof b, "%d profile%s: %s; sun shafts %s", profiles, profiles == 1 ? "" : "s", now[0] ? now : "-",
-             shafts < 0 ? "none" : shafts == 2 ? "high" : shafts == 1 ? "normal" : "low");
+    char b[512];
+    snprintf(b, sizeof b, "%d profile%s: %s; sun shafts %s\nCamera: %s; grain effects %zu", profiles,
+             profiles == 1 ? "" : "s", now[0] ? now : "-", shafts < 0 ? "none" : shafts == 2 ? "high" : shafts == 1 ? "normal" : "low",
+             cam[0] ? cam : "-", grain);
     *status = b;
     return true;
 }

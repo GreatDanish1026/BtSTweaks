@@ -117,6 +117,13 @@ std::atomic<int> g_ao{0};                     // Ao: 0 game, 1 better where used
 std::atomic<int> g_ssr{0};                    // Ssr: 1 full-res reflections where the game uses them
 std::atomic<bool> g_taa{false};               // Taa: TAA instead of FXAA
 std::atomic<bool> g_shaftsHigh{false};        // SunShaftsHigh
+// Camera tab: effects switched off (the game decides otherwise).
+std::atomic<bool> g_dofOff{false}, g_caOff{false}, g_vignetteOff{false}, g_dirtOff{false}, g_strokesOff{false},
+    g_grainOff{false};
+struct BoolKey { const char* key; std::atomic<bool>* value; };
+const BoolKey kCameraKeys[] = {{"NoDepthOfField", &g_dofOff},  {"NoChromaticAberration", &g_caOff},
+                               {"NoVignette", &g_vignetteOff},  {"NoLensDirt", &g_dirtOff},
+                               {"NoLightLeaks", &g_strokesOff}, {"NoFilmGrain", &g_grainOff}};
 std::mutex g_fxMutex;
 std::string g_fxStatus;                       // what the effects code found, for the overlay
 
@@ -141,6 +148,8 @@ void LoadSettings() {
     if (reshade::get_config_value(nullptr, DT_PRODUCT, "Ssr", i)) g_ssr = std::clamp(i, 0, 1);  // 2 (everywhere) broke the picture
     if (reshade::get_config_value(nullptr, DT_PRODUCT, "Taa", b)) g_taa = b;
     if (reshade::get_config_value(nullptr, DT_PRODUCT, "SunShaftsHigh", b)) g_shaftsHigh = b;
+    for (const BoolKey& k : kCameraKeys)
+        if (reshade::get_config_value(nullptr, DT_PRODUCT, k.key, b)) *k.value = b;
 }
 
 void SaveSettings() {
@@ -157,6 +166,7 @@ void SaveSettings() {
     reshade::set_config_value(nullptr, DT_PRODUCT, "Ssr", g_ssr.load());
     reshade::set_config_value(nullptr, DT_PRODUCT, "Taa", g_taa.load());
     reshade::set_config_value(nullptr, DT_PRODUCT, "SunShaftsHigh", g_shaftsHigh.load());
+    for (const BoolKey& k : kCameraKeys) reshade::set_config_value(nullptr, DT_PRODUCT, k.key, k.value->load());
 }
 
 // ---------------------------------------------------------------- swap chain: 8-bit -> 16-bit float
@@ -865,7 +875,8 @@ void ApplyFloat(float (*get)(), void (*set)(float), float& lastSet, std::atomic<
 void ApplyEffects() {
     static bool failed = false;
     if (failed) return;
-    const effects::Wanted w = {g_gfxOn, g_ao, g_ssr, g_taa, g_shaftsHigh};
+    const effects::Wanted w = {g_gfxOn, g_ao,          g_ssr,     g_taa,        g_shaftsHigh, g_dofOff,
+                               g_caOff, g_vignetteOff, g_dirtOff, g_strokesOff, g_grainOff};
     std::string status;
     if (!effects::Update(w, &status)) {
         failed = true;
@@ -992,7 +1003,8 @@ void LiveCamera(FILE* f) {
 void LiveDump() {
     static const char* const classes[] = {
         "PostProcessingBehaviour", "ScreenSpaceReflection", "SunShafts", "GlobalFog", "CameraMotionBlur", "TiltShift",
-        "DepthOfFieldDeprecated", "MirrorReflection", "CrossPlatformLightQuality", "CameraUpscaler", "SceneGraphicsSettings"};
+        "DepthOfFieldDeprecated", "MirrorReflection", "CrossPlatformLightQuality", "CameraUpscaler", "SceneGraphicsSettings",
+        "NoiseAndGrain", "NoiseAndScratches", "LensAberrations", "LensAberrationsGame"};
     const bool ok = il2cpp_probe::RunLive(g_exeDir + DT_PRODUCT_W L"-live.txt", classes, sizeof classes / sizeof classes[0],
                                           LiveCamera);
     Log(ok ? "live settings written to " DT_PRODUCT "-live.txt" : "live settings: couldn't write the file");
@@ -1058,16 +1070,105 @@ void Help(const char* text) {
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text);
 }
 
-void DrawPanel() {
-    ImGui::TextDisabled(DT_PRODUCT " " DT_VERSION);
-    ImGui::SameLine();
-    if (g_upgraded)
-        ImGui::TextColored(kGood, "  HDR %s", g_hdrWanted ? "on" : "off (SDR look)");
-    else
-        ImGui::TextColored(kWarn, "  HDR: %s", g_hdrStatus.c_str());
+// The effects status: line 0 the effects, line 1 the camera effects.
+std::string FxStatusLine(int line) {
+    std::lock_guard<std::mutex> lock(g_fxMutex);
+    const size_t nl = g_fxStatus.find('\n');
+    if (line == 0) return g_fxStatus.substr(0, nl);
+    return nl == std::string::npos ? std::string() : g_fxStatus.substr(nl + 1);
+}
 
+bool Switch(const char* label, std::atomic<bool>& value, const char* help) {
+    bool v = value;
+    const bool changed = ImGui::Checkbox(label, &v);
+    if (changed) value = v;
+    Help(help);
+    return changed;
+}
+
+bool DrawGraphicsTab() {
     bool save = false;
-    ImGui::SeparatorText("HDR");
+    save |= Switch("16x texture filtering", g_aniso,
+                   "The game leaves anisotropic filtering off, so ground, roads and walls blur at an angle.\n"
+                   "This forces 16x on every texture. Costs very little.");
+    float sd = g_shadowDistMul;
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::SliderFloat("Shadow distance", &sd, kMulMin, kMulMax, "%.2fx", ImGuiSliderFlags_AlwaysClamp))
+        g_shadowDistMul = sd, save = true;
+    Help("How far shadows are drawn, as a multiple of the game's value (it sets it per scene,\n"
+         "60 in the first scene). Farther shadows are spread over the same shadow\n"
+         "map, so raise the sun's shadow map with it.");
+    float lod = g_lodMul;
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::SliderFloat("Detail distance", &lod, kMulMin, kMulMax, "%.2fx", ImGuiSliderFlags_AlwaysClamp))
+        g_lodMul = lod, save = true;
+    Help("Unity's LOD bias, as a multiple of the game's value: models switch to their simpler\n"
+         "versions farther away.");
+    static const int sunValues[] = {0, 4096, 8192};
+    static const char* sunNames[] = {"Game", "4096", "8192"};
+    int sunIndex = g_sunShadow == 8192 ? 2 : g_sunShadow == 4096 ? 1 : 0;
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::Combo("Sun shadow map", &sunIndex, sunNames, 3)) g_sunShadow = sunValues[sunIndex], save = true;
+    Help("The resolution of the sun's shadow map (shared by its 4 cascades). Sharper shadows,\n"
+         "especially with a longer shadow distance. 8192 costs more video memory and time.");
+    if (g_gameShadowDist >= 0)
+        ImGui::TextDisabled("Game: shadow distance %.0f, LOD bias %.2g, filtering %s, sun %s", g_gameShadowDist.load(),
+                            g_gameLod.load(), g_gameAniso == 0 ? "off" : g_gameAniso == 1 ? "per texture" : "forced",
+                            !g_sunFound ? "none" : g_gameSunCustom > 0 ? "custom" : "tier");
+    return save;
+}
+
+bool DrawEffectsTab() {
+    bool save = false;
+    static const char* useNames[] = {"Game", "Better where used", "Everywhere"};
+    int ao = g_ao;
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::Combo("Ambient occlusion", &ao, useNames, 3)) g_ao = ao, save = true;
+    Help("Contact shadows in corners and creases.\n"
+         "Better where used: where a scene has it, 16 samples at full resolution (the game uses\n"
+         "10 at half resolution). Everywhere: also turns it on in scenes made without it, which\n"
+         "changes their look.");
+    bool ssr = g_ssr != 0;
+    if (ImGui::Checkbox("Sharper reflections", &ssr)) g_ssr = ssr ? 1 : 0, save = true;
+    Help("In scenes with screen-space reflections (floors, cars, water), draws them at full\n"
+         "resolution instead of the game's low setting. Scenes made without them stay without:\n"
+         "turning them on there breaks the picture.");
+    save |= Switch("Temporal anti-aliasing", g_taa,
+                   "Uses the TAA built into the game's post-processing instead of its FXAA: steadier edges\n"
+                   "and less shimmer on fine detail, a little softer.");
+    save |= Switch("High-resolution sun shafts", g_shaftsHigh,
+                   "Draws the light shafts at full quality where the game leaves them at its low setting.");
+    const std::string s = FxStatusLine(0);
+    if (!s.empty()) ImGui::TextDisabled("Now: %s", s.c_str());
+    return save;
+}
+
+bool DrawCameraTab() {
+    bool save = false;
+    ImGui::TextDisabled("Each switch turns an effect off; unticked, the game decides, scene by scene.");
+    save |= Switch("No depth of field", g_dofOff,
+                   "Turns off the background and foreground blur in cutscenes and close-ups. The game\n"
+                   "uses it to frame shots, so close-ups look flatter without it.");
+    save |= Switch("No chromatic aberration", g_caOff,
+                   "Turns off the colour fringes towards the edges of the picture. Story scenes that\n"
+                   "use them on purpose (dreams, strong emotions) lose them too.");
+    save |= Switch("No vignette", g_vignetteOff,
+                   "Turns off the darkened corners. Story scenes that use a stronger vignette lose it too.");
+    save |= Switch("No lens dirt", g_dirtOff,
+                   "Turns off the smudges that bright lights show through the bloom. The bloom stays.");
+    save |= Switch("No light leaks", g_strokesOff,
+                   "Turns off the game's soft coloured light leaks (its \"colour strokes\" effect) at the\n"
+                   "edges of the picture.");
+    save |= Switch("No film grain", g_grainOff,
+                   "Turns off grain and scratch effects on the camera, where a scene has them. The count\n"
+                   "below shows how many are in the current scene.");
+    const std::string s = FxStatusLine(1);
+    if (!s.empty()) ImGui::TextDisabled("Now: %s", s.c_str());
+    return save;
+}
+
+bool DrawHdrTab() {
+    bool save = false;
     save |= ImGui::Checkbox("HDR", &g_hdrWanted);
     Help("The game's menu has no HDR option. The game renders as usual, with its own colour\n"
          "grade, and the add-on turns the finished picture into HDR, brightening only the\n"
@@ -1104,66 +1205,72 @@ void DrawPanel() {
          "punchier; higher stays closer to SDR. Default 50%.");
     ImGui::EndDisabled();
     if (g_hdrPeak < g_hdrPaper) ImGui::TextColored(kWarn, "Peak is below paper white: highlights aren't stretched.");
+    return save;
+}
 
-    ImGui::SeparatorText("Graphics");
+void DrawAdvancedTab() {
+    ImGui::TextDisabled("Swap chain: %s; display: Windows HDR %s, %.0f nits", g_upgraded ? "16-bit float" : "8-bit",
+                        g_displayHdr ? "on" : "off/unknown", g_displayPeak);
+    ImGui::TextDisabled("UI kept at paper white in %llu of %llu frames", static_cast<unsigned long long>(g_uiFrames.load()),
+                        static_cast<unsigned long long>(g_frames.load()));
+    ImGui::SetNextItemWidth(ControlWidth());
+    const char* views[] = {"Off", "Tint what counts as UI", "Show what counts as UI"};
+    ImGui::Combo("HDR debug view", &g_debugView, views, 3);
+    Help("For diagnosing HDR. Tint: pixels kept at paper white as UI turn magenta.\n"
+         "Show: what counts as UI in white.");
+    if (ImGui::Button("Log one frame's drawing")) g_drawLogArmed = true;
+    Help("Writes the next frame's render target changes and draw calls on screen-sized targets\n"
+         "to " DT_PRODUCT "-draws.txt next to the game's exe.");
+    ImGui::Separator();
+    ImGui::TextDisabled("Main thread: %llu frames (%s)", static_cast<unsigned long long>(il2cpp_main::g_state.calls.load()),
+                        il2cpp_main::Report().c_str());
+    if (ImGui::Button("Log Unity's quality settings")) il2cpp_main::Post(LogQuality);
+    if (ImGui::Button("Write the camera's and effects' settings")) il2cpp_main::Post(LiveDump);
+    Help("Read-only: writes the main camera and the live post-processing and effect objects\n"
+         "with their settings to " DT_PRODUCT "-live.txt next to the game's exe.");
+    if (ImGui::Button("Write the game's settings classes")) RunProbe();
+    Help("Read-only: writes the game's settings classes, their fields and current values\n"
+         "to " DT_PRODUCT "-il2cpp.txt next to the game's exe.");
+    ImGui::TextDisabled("Log: " DT_PRODUCT ".log next to the game's exe");
+}
+
+void DrawPanel() {
+    ImGui::TextDisabled(DT_PRODUCT " " DT_VERSION);
+    ImGui::SameLine();
+    if (g_upgraded)
+        ImGui::TextColored(kGood, "  HDR %s", g_hdrWanted ? "on" : "off (SDR look)");
+    else
+        ImGui::TextColored(kWarn, "  HDR: %s", g_hdrStatus.c_str());
     bool gfxOn = g_gfxOn;
-    if (ImGui::Checkbox("Graphics tweaks (F8)", &gfxOn)) g_gfxOn = gfxOn;
-    Help("Switches every graphics option below off and on, to compare. Not saved: they're on\n"
-         "each time the game starts.");
+    if (ImGui::Checkbox("Graphics, effects and camera tweaks (F8)", &gfxOn)) g_gfxOn = gfxOn;
+    Help("Switches every option in the Graphics, Effects and Camera tabs off and on, to compare.\n"
+         "Not saved: they're on each time the game starts.");
     if (!il2cpp_main::g_state.calls) ImGui::TextColored(kWarn, "Waiting for the game's main thread...");
-    bool aniso = g_aniso;
-    if (ImGui::Checkbox("16x texture filtering", &aniso)) g_aniso = aniso, save = true;
-    Help("The game leaves anisotropic filtering off, so ground, roads and walls blur at an angle.\n"
-         "This forces 16x on every texture. Costs very little.");
-    float sd = g_shadowDistMul;
-    ImGui::SetNextItemWidth(ControlWidth());
-    if (ImGui::SliderFloat("Shadow distance", &sd, kMulMin, kMulMax, "%.2fx", ImGuiSliderFlags_AlwaysClamp))
-        g_shadowDistMul = sd, save = true;
-    Help("How far shadows are drawn, as a multiple of the game's value (it sets it per scene,\n"
-         "60 in the first scene). Farther shadows are spread over the same shadow\n"
-         "map, so raise the sun's shadow map with it.");
-    float lod = g_lodMul;
-    ImGui::SetNextItemWidth(ControlWidth());
-    if (ImGui::SliderFloat("Detail distance", &lod, kMulMin, kMulMax, "%.2fx", ImGuiSliderFlags_AlwaysClamp))
-        g_lodMul = lod, save = true;
-    Help("Unity's LOD bias, as a multiple of the game's value: models switch to their simpler\n"
-         "versions farther away.");
-    static const int sunValues[] = {0, 4096, 8192};
-    static const char* sunNames[] = {"Game", "4096", "8192"};
-    int sunIndex = g_sunShadow == 8192 ? 2 : g_sunShadow == 4096 ? 1 : 0;
-    ImGui::SetNextItemWidth(ControlWidth());
-    if (ImGui::Combo("Sun shadow map", &sunIndex, sunNames, 3)) g_sunShadow = sunValues[sunIndex], save = true;
-    Help("The resolution of the sun's shadow map (shared by its 4 cascades). Sharper shadows,\n"
-         "especially with a longer shadow distance. 8192 costs more video memory and time.");
-    if (g_gameShadowDist >= 0)
-        ImGui::TextDisabled("Game: shadow distance %.0f, LOD bias %.2g, filtering %s, sun %s", g_gameShadowDist.load(),
-                            g_gameLod.load(), g_gameAniso == 0 ? "off" : g_gameAniso == 1 ? "per texture" : "forced",
-                            !g_sunFound ? "none" : g_gameSunCustom > 0 ? "custom" : "tier");
+    ImGui::Spacing();
 
-    ImGui::SeparatorText("Effects");
-    static const char* useNames[] = {"Game", "Better where used", "Everywhere"};
-    int ao = g_ao;
-    ImGui::SetNextItemWidth(ControlWidth());
-    if (ImGui::Combo("Ambient occlusion", &ao, useNames, 3)) g_ao = ao, save = true;
-    Help("Contact shadows in corners and creases.\n"
-         "Better where used: where a scene has it, 16 samples at full resolution (the game uses\n"
-         "10 at half resolution). Everywhere: also turns it on in scenes made without it, which\n"
-         "changes their look.");
-    bool ssr = g_ssr != 0;
-    if (ImGui::Checkbox("Sharper reflections", &ssr)) g_ssr = ssr ? 1 : 0, save = true;
-    Help("In scenes with screen-space reflections (floors, cars, water), draws them at full\n"
-         "resolution instead of the game's low setting. Scenes made without them stay without:\n"
-         "turning them on there breaks the picture.");
-    bool taa = g_taa;
-    if (ImGui::Checkbox("Temporal anti-aliasing", &taa)) g_taa = taa, save = true;
-    Help("Uses the TAA built into the game's post-processing instead of its FXAA: steadier edges\n"
-         "and less shimmer on fine detail, a little softer.");
-    bool shafts = g_shaftsHigh;
-    if (ImGui::Checkbox("High-resolution sun shafts", &shafts)) g_shaftsHigh = shafts, save = true;
-    Help("Draws the light shafts at full quality: the game leaves them at its low setting.");
-    {
-        std::lock_guard<std::mutex> lock(g_fxMutex);
-        if (!g_fxStatus.empty()) ImGui::TextDisabled("Effects: %s", g_fxStatus.c_str());
+    bool save = false;
+    if (ImGui::BeginTabBar("tabs")) {
+        if (ImGui::BeginTabItem("Graphics")) {
+            save |= DrawGraphicsTab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Effects")) {
+            save |= DrawEffectsTab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Camera")) {
+            save |= DrawCameraTab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("HDR")) {
+            save |= DrawHdrTab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Advanced")) {
+            DrawAdvancedTab();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
     }
 
     static bool unlogged = false;
@@ -1173,35 +1280,13 @@ void DrawPanel() {
     }
     if (unlogged && !ImGui::IsAnyItemActive()) {
         Log("settings: HDR %s, peak %d, paper white %d nits, highlights from %d%%; 16x filtering %d, shadow distance %.2fx, "
-            "detail distance %.2fx, sun shadow map %d; AO %d, SSR %d, TAA %d, sun shafts high %d",
+            "detail distance %.2fx, sun shadow map %d; AO %d, SSR %d, TAA %d, sun shafts high %d; camera off: DoF %d, "
+            "CA %d, vignette %d, lens dirt %d, light leaks %d, grain %d",
             g_hdrWanted ? "on" : "off", g_hdrPeak, g_hdrPaper, g_hdrStart, g_aniso ? 1 : 0, g_shadowDistMul.load(),
-            g_lodMul.load(), g_sunShadow.load(), g_ao.load(), g_ssr.load(), g_taa ? 1 : 0, g_shaftsHigh ? 1 : 0);
+            g_lodMul.load(), g_sunShadow.load(), g_ao.load(), g_ssr.load(), g_taa ? 1 : 0, g_shaftsHigh ? 1 : 0,
+            g_dofOff ? 1 : 0, g_caOff ? 1 : 0, g_vignetteOff ? 1 : 0, g_dirtOff ? 1 : 0, g_strokesOff ? 1 : 0,
+            g_grainOff ? 1 : 0);
         unlogged = false;
-    }
-
-    if (ImGui::CollapsingHeader("Advanced")) {
-        ImGui::TextDisabled("Swap chain: %s; display: Windows HDR %s, %.0f nits", g_upgraded ? "16-bit float" : "8-bit",
-                            g_displayHdr ? "on" : "off/unknown", g_displayPeak);
-        ImGui::TextDisabled("UI kept at paper white in %llu of %llu frames", static_cast<unsigned long long>(g_uiFrames.load()),
-                            static_cast<unsigned long long>(g_frames.load()));
-        ImGui::SetNextItemWidth(ControlWidth());
-        const char* views[] = {"Off", "Tint what counts as UI", "Show what counts as UI"};
-        ImGui::Combo("HDR debug view", &g_debugView, views, 3);
-        Help("For diagnosing HDR. Tint: pixels kept at paper white as UI turn magenta.\n"
-             "Show: what counts as UI in white.");
-        if (ImGui::Button("Log one frame's drawing")) g_drawLogArmed = true;
-        Help("Writes the next frame's render target changes and draw calls on screen-sized targets\n"
-             "to " DT_PRODUCT "-draws.txt next to the game's exe.");
-        ImGui::TextDisabled("Main thread: %llu frames (%s)", static_cast<unsigned long long>(il2cpp_main::g_state.calls.load()),
-                            il2cpp_main::Report().c_str());
-        if (ImGui::Button("Log Unity's quality settings")) il2cpp_main::Post(LogQuality);
-        if (ImGui::Button("Write the camera's and effects' settings")) il2cpp_main::Post(LiveDump);
-        Help("Read-only: writes the main camera and the live post-processing and effect objects\n"
-             "with their settings to " DT_PRODUCT "-live.txt next to the game's exe.");
-        if (ImGui::Button("Write the game's settings classes")) RunProbe();
-        Help("Read-only: writes the game's settings classes, their fields and current values\n"
-             "to " DT_PRODUCT "-il2cpp.txt next to the game's exe.");
-        ImGui::TextDisabled("Log: " DT_PRODUCT ".log next to the game's exe");
     }
 }
 
