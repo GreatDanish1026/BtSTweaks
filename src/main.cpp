@@ -46,6 +46,9 @@
 #include "hdr_ps.h"  // built from src/hdr.hlsl by build.ps1
 #include "hdr_vs.h"
 #include "version.h"
+#include "il2cpp_probe.hpp"
+#include "il2cpp_main.hpp"
+#include "effects.hpp"
 
 extern "C" __declspec(dllexport) const char* NAME = DT_PRODUCT;
 extern "C" __declspec(dllexport) const char* DESCRIPTION =
@@ -63,7 +66,7 @@ ULONGLONG g_loadTick = 0;
 std::wstring g_exeDir;
 
 void Log(const char* fmt, ...) {
-    char buf[1024];
+    char buf[2048];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -103,6 +106,20 @@ int g_hdrStart = 50;         // HdrHighlightStart, % of SDR white (as encoded)
 int g_debugView = 0;         // not saved: 0 off, 1 tint UI, 2 UI alpha
 bool g_showWindow = true;    // ShowWindow
 
+// Graphics (applied on the game's main thread; every option starts at the game's own value).
+constexpr float kMulMin = 1.0f, kMulMax = 4.0f;
+std::atomic<bool> g_gfxOn{true};              // F8 switches every graphics tweak off and on
+std::atomic<bool> g_aniso{false};             // Anisotropic: force 16x filtering
+std::atomic<float> g_shadowDistMul{1.0f};     // ShadowDistance: times the game's per-scene value
+std::atomic<float> g_lodMul{1.0f};            // LodBias: times the game's value
+std::atomic<int> g_sunShadow{0};              // SunShadow: 0 game, 4096, 8192 (custom resolution)
+std::atomic<int> g_ao{0};                     // Ao: 0 game, 1 better where used, 2 everywhere
+std::atomic<int> g_ssr{0};                    // Ssr: 1 full-res reflections where the game uses them
+std::atomic<bool> g_taa{false};               // Taa: TAA instead of FXAA
+std::atomic<bool> g_shaftsHigh{false};        // SunShaftsHigh
+std::mutex g_fxMutex;
+std::string g_fxStatus;                       // what the effects code found, for the overlay
+
 void LoadSettings() {
     reshade::get_config_value(nullptr, DT_PRODUCT, "Hdr", g_hdrWanted);
     reshade::get_config_value(nullptr, DT_PRODUCT, "HdrPeak", g_hdrPeak);
@@ -113,6 +130,17 @@ void LoadSettings() {
     g_hdrPaper = std::clamp(g_hdrPaper, kPaperMin, kPaperMax);
     g_hdrStart = std::clamp(g_hdrStart, kStartMin, kStartMax);
     g_hdrAtLaunch = g_hdrWanted;
+    bool b = false;
+    float f = 1;
+    int i = 0;
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "Anisotropic", b)) g_aniso = b;
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "ShadowDistance", f)) g_shadowDistMul = std::clamp(f, kMulMin, kMulMax);
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "LodBias", f)) g_lodMul = std::clamp(f, kMulMin, kMulMax);
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "SunShadow", i)) g_sunShadow = i == 4096 || i == 8192 ? i : 0;
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "Ao", i)) g_ao = std::clamp(i, 0, 2);
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "Ssr", i)) g_ssr = std::clamp(i, 0, 1);  // 2 (everywhere) broke the picture
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "Taa", b)) g_taa = b;
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "SunShaftsHigh", b)) g_shaftsHigh = b;
 }
 
 void SaveSettings() {
@@ -121,6 +149,14 @@ void SaveSettings() {
     reshade::set_config_value(nullptr, DT_PRODUCT, "HdrPaperWhite", g_hdrPaper);
     reshade::set_config_value(nullptr, DT_PRODUCT, "HdrHighlightStart", g_hdrStart);
     reshade::set_config_value(nullptr, DT_PRODUCT, "ShowWindow", g_showWindow);
+    reshade::set_config_value(nullptr, DT_PRODUCT, "Anisotropic", g_aniso.load());
+    reshade::set_config_value(nullptr, DT_PRODUCT, "ShadowDistance", g_shadowDistMul.load());
+    reshade::set_config_value(nullptr, DT_PRODUCT, "LodBias", g_lodMul.load());
+    reshade::set_config_value(nullptr, DT_PRODUCT, "SunShadow", g_sunShadow.load());
+    reshade::set_config_value(nullptr, DT_PRODUCT, "Ao", g_ao.load());
+    reshade::set_config_value(nullptr, DT_PRODUCT, "Ssr", g_ssr.load());
+    reshade::set_config_value(nullptr, DT_PRODUCT, "Taa", g_taa.load());
+    reshade::set_config_value(nullptr, DT_PRODUCT, "SunShaftsHigh", g_shaftsHigh.load());
 }
 
 // ---------------------------------------------------------------- swap chain: 8-bit -> 16-bit float
@@ -756,7 +792,240 @@ void OnDestroyResource(device* dev, resource r) {
     }
 }
 
+// The IL2CPP probe (src/il2cpp_probe.hpp): 0 idle, 1 running, 2 written, 3 failed.
+std::atomic<int> g_probeState{0};
+bool g_probeReported = false;
+
+void RunProbe() {
+    int st = g_probeState;
+    if (st >= 2 && g_probeState.compare_exchange_strong(st, 0)) g_probeReported = false;  // run again
+    il2cpp_probe::Start(g_exeDir + DT_PRODUCT_W L"-il2cpp.txt", &g_probeState);
+}
+
+// ---------------------------------------------------------------- graphics (main thread)
+
+// Each option tracks the game's own value: a value that differs from what the add-on last set
+// was set by the game (a new scene, the game's menu) and becomes the new base.
+struct Graphics {
+    bool resolved = false, ok = false;
+    float (*getShadowDistance)() = nullptr;
+    void (*setShadowDistance)(float) = nullptr;
+    float (*getLodBias)() = nullptr;
+    void (*setLodBias)(float) = nullptr;
+    int (*getAniso)() = nullptr;
+    void (*setAniso)(int) = nullptr;
+    void (*setAnisoLimits)(int, int) = nullptr;
+    void* (*getSun)() = nullptr;
+    int (*getCustomRes)(void*) = nullptr;
+    void (*setCustomRes)(void*, int) = nullptr;
+    int (*getLightShadowRes)(void*) = nullptr;
+    float shadowSet = NAN, lodSet = NAN;
+    int anisoSet = -1;
+    void* sunSeen = nullptr;
+    int sunSet = -1;
+} g_gfx;
+
+// The game's values, for the overlay.
+std::atomic<float> g_gameShadowDist{-1}, g_gameLod{-1};
+std::atomic<int> g_gameAniso{-1}, g_gameSunRes{-1}, g_gameSunCustom{-1};
+std::atomic<bool> g_sunFound{false};
+
+void ResolveGraphics() {
+    using il2cpp_main::Icall;
+    g_gfx.resolved = true;
+    auto get = [](auto& f, const char* name) {
+        f = reinterpret_cast<std::remove_reference_t<decltype(f)>>(Icall(name));
+        if (!f) Log("graphics: Unity call %s not found", name);
+        return f != nullptr;
+    };
+    bool ok = true;
+    ok &= get(g_gfx.getShadowDistance, "UnityEngine.QualitySettings::get_shadowDistance()");
+    ok &= get(g_gfx.setShadowDistance, "UnityEngine.QualitySettings::set_shadowDistance(System.Single)");
+    ok &= get(g_gfx.getLodBias, "UnityEngine.QualitySettings::get_lodBias()");
+    ok &= get(g_gfx.setLodBias, "UnityEngine.QualitySettings::set_lodBias(System.Single)");
+    ok &= get(g_gfx.getAniso, "UnityEngine.QualitySettings::get_anisotropicFiltering()");
+    ok &= get(g_gfx.setAniso, "UnityEngine.QualitySettings::set_anisotropicFiltering(UnityEngine.AnisotropicFiltering)");
+    get(g_gfx.setAnisoLimits, "UnityEngine.Texture::SetGlobalAnisotropicFilteringLimits(System.Int32,System.Int32)");
+    ok &= get(g_gfx.getSun, "UnityEngine.RenderSettings::get_sun()");
+    ok &= get(g_gfx.getCustomRes, "UnityEngine.Light::get_shadowCustomResolution()");
+    ok &= get(g_gfx.setCustomRes, "UnityEngine.Light::set_shadowCustomResolution(System.Int32)");
+    get(g_gfx.getLightShadowRes, "UnityEngine.Light::get_shadowResolution()");
+    g_gfx.ok = ok;
+    Log("graphics: Unity calls %s", ok ? "found" : "MISSING: graphics options off");
+}
+
+void ApplyFloat(float (*get)(), void (*set)(float), float& lastSet, std::atomic<float>& game, float mul) {
+    const float v = get();
+    if (!(std::fabs(v - lastSet) < 1e-3f)) game = v;  // set by the game
+    const float target = game * mul;
+    if (std::fabs(v - target) >= 1e-3f) set(target);
+    lastSet = target;
+}
+
+void ApplyEffects() {
+    static bool failed = false;
+    if (failed) return;
+    const effects::Wanted w = {g_gfxOn, g_ao, g_ssr, g_taa, g_shaftsHigh};
+    std::string status;
+    if (!effects::Update(w, &status)) {
+        failed = true;
+        Log("effects: %s", status.c_str());
+    }
+    std::lock_guard<std::mutex> lock(g_fxMutex);
+    if (status != g_fxStatus) {
+        if (!failed) Log("effects: %s", status.c_str());
+        g_fxStatus = status;
+    }
+}
+
+void ApplyGraphics() {
+    ApplyEffects();
+    if (!g_gfx.resolved) ResolveGraphics();
+    if (!g_gfx.ok) return;
+    const bool on = g_gfxOn;
+    ApplyFloat(g_gfx.getShadowDistance, g_gfx.setShadowDistance, g_gfx.shadowSet, g_gameShadowDist,
+               on ? g_shadowDistMul.load() : 1.0f);
+    ApplyFloat(g_gfx.getLodBias, g_gfx.setLodBias, g_gfx.lodSet, g_gameLod, on ? g_lodMul.load() : 1.0f);
+
+    // Anisotropic filtering: the game leaves it off; ForceEnable with a 16x minimum.
+    const int a = g_gfx.getAniso();
+    if (a != g_gfx.anisoSet) g_gameAniso = a;
+    const int aTarget = on && g_aniso ? 2 : g_gameAniso.load();
+    if (a != aTarget) {
+        g_gfx.setAniso(aTarget);
+        if (g_gfx.setAnisoLimits) {
+            if (aTarget == 2 && g_gameAniso != 2) g_gfx.setAnisoLimits(16, 16);
+            else g_gfx.setAnisoLimits(9, 16);  // Unity's defaults
+        }
+    }
+    g_gfx.anisoSet = aTarget;
+
+    // The sun's shadow map: a custom resolution on RenderSettings.sun (the game sets only the
+    // resolution tier, so the custom value, which takes priority, stays the add-on's).
+    void* sun = g_gfx.getSun();
+    g_sunFound = sun != nullptr;
+    if (!sun) return;
+    if (sun != g_gfx.sunSeen) {  // a new scene's sun
+        g_gfx.sunSeen = sun;
+        g_gfx.sunSet = -1;
+    }
+    const int c = g_gfx.getCustomRes(sun);
+    if (c != g_gfx.sunSet) g_gameSunCustom = c;
+    if (g_gfx.getLightShadowRes) g_gameSunRes = g_gfx.getLightShadowRes(sun);
+    const int cTarget = on && g_sunShadow ? g_sunShadow.load() : g_gameSunCustom.load();
+    if (c != cTarget) g_gfx.setCustomRes(sun, cTarget);
+    g_gfx.sunSet = cTarget;
+
+    // Log what Unity reports after a change (read back, not what was asked for).
+    static std::string lastLogged;
+    char b[256];
+    snprintf(b, sizeof b, "shadow distance %g (game %g), LOD bias %g (game %g), filtering mode %d (game %d), sun custom %d (game %d)",
+             g_gfx.getShadowDistance(), g_gameShadowDist.load(), g_gfx.getLodBias(), g_gameLod.load(), g_gfx.getAniso(),
+             g_gameAniso.load(), g_gfx.getCustomRes(sun), g_gameSunCustom.load());
+    if (lastLogged != b) {
+        lastLogged = b;
+        Log("graphics applied: %s", b);
+    }
+}
+
+// Unity's quality settings, read on the main thread through Unity's internal calls.
+void LogQuality() {
+    using namespace il2cpp_main;
+    struct Item { const char* name; char kind; };  // f float, i int/enum, b bool
+    static const Item items[] = {
+        {"GetQualityLevel", 'i'}, {"get_shadows", 'i'}, {"get_shadowResolution", 'i'}, {"get_shadowProjection", 'i'},
+        {"get_shadowDistance", 'f'}, {"get_shadowCascades", 'i'}, {"get_shadowCascade2Split", 'f'},
+        {"get_shadowNearPlaneOffset", 'f'}, {"get_shadowmaskMode", 'i'}, {"get_lodBias", 'f'},
+        {"get_maximumLODLevel", 'i'}, {"get_anisotropicFiltering", 'i'}, {"get_masterTextureLimit", 'i'},
+        {"get_pixelLightCount", 'i'}, {"get_antiAliasing", 'i'}, {"get_softParticles", 'b'},
+        {"get_softVegetation", 'b'}, {"get_realtimeReflectionProbes", 'b'}, {"get_billboardsFaceCameraPosition", 'b'},
+        {"get_particleRaycastBudget", 'i'}, {"get_skinWeights", 'i'}, {"get_streamingMipmapsActive", 'b'},
+        {"get_vSyncCount", 'i'}, {"get_asyncUploadTimeSlice", 'i'}, {"get_asyncUploadBufferSize", 'i'}};
+    std::string line = "Unity quality (hook calls: " + Report() + "):";
+    for (const Item& it : items) {
+        const std::string full = std::string("UnityEngine.QualitySettings::") + it.name + "()";
+        void* f = Icall(full.c_str());
+        char b[96];
+        const char* shortName = strncmp(it.name, "get_", 4) ? it.name : it.name + 4;
+        if (!f) snprintf(b, sizeof b, " %s=?", shortName);
+        else if (it.kind == 'f') snprintf(b, sizeof b, " %s=%g", shortName, reinterpret_cast<float (*)()>(f)());
+        else if (it.kind == 'b') snprintf(b, sizeof b, " %s=%d", shortName, reinterpret_cast<bool (*)()>(f)() ? 1 : 0);
+        else snprintf(b, sizeof b, " %s=%d", shortName, reinterpret_cast<int (*)()>(f)());
+        line += b;
+    }
+    Log("%s", line.c_str());
+    Log("sun light: %s, shadow resolution tier %d, custom %d (game's custom %d)", g_sunFound ? "found" : "none",
+        g_gameSunRes.load(), g_gfx.ok && g_sunFound ? g_gfx.getCustomRes(g_gfx.getSun()) : -1, g_gameSunCustom.load());
+}
+
+// Camera.main's settings, for the live dump.
+void LiveCamera(FILE* f) {
+    using il2cpp_main::Icall;
+    auto mainCam = reinterpret_cast<void* (*)()>(Icall("UnityEngine.Camera::get_main()"));
+    auto count = reinterpret_cast<int (*)()>(Icall("UnityEngine.Camera::get_allCamerasCount()"));
+    void* cam = mainCam ? mainCam() : nullptr;
+    fprintf(f, "cameras: %d, Camera.main %s\n", count ? count() : -1, cam ? "found" : "none");
+    if (!cam) return;
+    struct Item { const char* name; char kind; };
+    static const Item items[] = {{"get_renderingPath", 'i'}, {"get_actualRenderingPath", 'i'}, {"get_nearClipPlane", 'f'},
+                                 {"get_farClipPlane", 'f'}, {"get_fieldOfView", 'f'}, {"get_allowMSAA", 'b'},
+                                 {"get_allowHDR", 'b'}, {"get_useOcclusionCulling", 'b'}, {"get_layerCullSpherical", 'b'},
+                                 {"get_depthTextureMode", 'i'}, {"get_cullingMask", 'i'}};
+    for (const Item& it : items) {
+        void* fn = Icall((std::string("UnityEngine.Camera::") + it.name + "()").c_str());
+        if (!fn) fprintf(f, "  %s: not found\n", it.name + 4);
+        else if (it.kind == 'f') fprintf(f, "  %s = %g\n", it.name + 4, reinterpret_cast<float (*)(void*)>(fn)(cam));
+        else if (it.kind == 'b') fprintf(f, "  %s = %d\n", it.name + 4, reinterpret_cast<bool (*)(void*)>(fn)(cam) ? 1 : 0);
+        else fprintf(f, "  %s = %d\n", it.name + 4, reinterpret_cast<int (*)(void*)>(fn)(cam));
+    }
+    if (auto lcd = reinterpret_cast<void* (*)(void*)>(Icall("UnityEngine.Camera::get_layerCullDistances()"))) {
+        const char* arr = static_cast<const char*>(lcd(cam));
+        if (arr) {
+            const float* v = reinterpret_cast<const float*>(arr + 0x20);
+            fprintf(f, "  layerCullDistances =");
+            for (int i = 0; i < 32; ++i) fprintf(f, " %g", v[i]);
+            fprintf(f, "\n");
+        }
+    }
+}
+
+void LiveDump() {
+    static const char* const classes[] = {
+        "PostProcessingBehaviour", "ScreenSpaceReflection", "SunShafts", "GlobalFog", "CameraMotionBlur", "TiltShift",
+        "DepthOfFieldDeprecated", "MirrorReflection", "CrossPlatformLightQuality", "CameraUpscaler", "SceneGraphicsSettings"};
+    const bool ok = il2cpp_probe::RunLive(g_exeDir + DT_PRODUCT_W L"-live.txt", classes, sizeof classes / sizeof classes[0],
+                                          LiveCamera);
+    Log(ok ? "live settings written to " DT_PRODUCT "-live.txt" : "live settings: couldn't write the file");
+}
+
+void ProbeOnPresent() {
+    ++il2cpp_main::g_state.frame;
+    static const ULONGLONG start = GetTickCount64();
+    static bool installTried = false;
+    if (!installTried && GetTickCount64() - start > 3000) {
+        installTried = true;
+        il2cpp_main::g_state.everyFrame.push_back(ApplyGraphics);
+        Log("main thread hooks: %s", il2cpp_main::Install().c_str());
+    }
+    static bool qualityLogged = false;
+    if (!qualityLogged && GetTickCount64() - start > 45000) {
+        qualityLogged = true;
+        Log("main thread hooks after 45 s: %s", il2cpp_main::Report().c_str());
+        il2cpp_main::Post(LogQuality);
+    }
+    const int st = g_probeState;
+    if (st >= 2 && !g_probeReported) {
+        Log(st == 2 ? "IL2CPP probe written to " DT_PRODUCT "-il2cpp.txt" : "IL2CPP probe: couldn't write its file");
+        g_probeReported = true;
+    }
+}
+
 void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, uint32_t, const rect*) {
+    if (g_runtime && g_runtime->is_key_pressed(VK_F8)) {
+        g_gfxOn = !g_gfxOn;
+        Log("graphics tweaks %s (F8)", g_gfxOn ? "on" : "off");
+    }
+    ProbeOnPresent();
     DrawLogOnPresent(sc);
     if (g_upgraded) {
         const bool ran = RunPass(queue, sc);
@@ -836,14 +1105,77 @@ void DrawPanel() {
     ImGui::EndDisabled();
     if (g_hdrPeak < g_hdrPaper) ImGui::TextColored(kWarn, "Peak is below paper white: highlights aren't stretched.");
 
+    ImGui::SeparatorText("Graphics");
+    bool gfxOn = g_gfxOn;
+    if (ImGui::Checkbox("Graphics tweaks (F8)", &gfxOn)) g_gfxOn = gfxOn;
+    Help("Switches every graphics option below off and on, to compare. Not saved: they're on\n"
+         "each time the game starts.");
+    if (!il2cpp_main::g_state.calls) ImGui::TextColored(kWarn, "Waiting for the game's main thread...");
+    bool aniso = g_aniso;
+    if (ImGui::Checkbox("16x texture filtering", &aniso)) g_aniso = aniso, save = true;
+    Help("The game leaves anisotropic filtering off, so ground, roads and walls blur at an angle.\n"
+         "This forces 16x on every texture. Costs very little.");
+    float sd = g_shadowDistMul;
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::SliderFloat("Shadow distance", &sd, kMulMin, kMulMax, "%.2fx", ImGuiSliderFlags_AlwaysClamp))
+        g_shadowDistMul = sd, save = true;
+    Help("How far shadows are drawn, as a multiple of the game's value (it sets it per scene,\n"
+         "60 in the first scene). Farther shadows are spread over the same shadow\n"
+         "map, so raise the sun's shadow map with it.");
+    float lod = g_lodMul;
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::SliderFloat("Detail distance", &lod, kMulMin, kMulMax, "%.2fx", ImGuiSliderFlags_AlwaysClamp))
+        g_lodMul = lod, save = true;
+    Help("Unity's LOD bias, as a multiple of the game's value: models switch to their simpler\n"
+         "versions farther away.");
+    static const int sunValues[] = {0, 4096, 8192};
+    static const char* sunNames[] = {"Game", "4096", "8192"};
+    int sunIndex = g_sunShadow == 8192 ? 2 : g_sunShadow == 4096 ? 1 : 0;
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::Combo("Sun shadow map", &sunIndex, sunNames, 3)) g_sunShadow = sunValues[sunIndex], save = true;
+    Help("The resolution of the sun's shadow map (shared by its 4 cascades). Sharper shadows,\n"
+         "especially with a longer shadow distance. 8192 costs more video memory and time.");
+    if (g_gameShadowDist >= 0)
+        ImGui::TextDisabled("Game: shadow distance %.0f, LOD bias %.2g, filtering %s, sun %s", g_gameShadowDist.load(),
+                            g_gameLod.load(), g_gameAniso == 0 ? "off" : g_gameAniso == 1 ? "per texture" : "forced",
+                            !g_sunFound ? "none" : g_gameSunCustom > 0 ? "custom" : "tier");
+
+    ImGui::SeparatorText("Effects");
+    static const char* useNames[] = {"Game", "Better where used", "Everywhere"};
+    int ao = g_ao;
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::Combo("Ambient occlusion", &ao, useNames, 3)) g_ao = ao, save = true;
+    Help("Contact shadows in corners and creases.\n"
+         "Better where used: where a scene has it, 16 samples at full resolution (the game uses\n"
+         "10 at half resolution). Everywhere: also turns it on in scenes made without it, which\n"
+         "changes their look.");
+    bool ssr = g_ssr != 0;
+    if (ImGui::Checkbox("Sharper reflections", &ssr)) g_ssr = ssr ? 1 : 0, save = true;
+    Help("In scenes with screen-space reflections (floors, cars, water), draws them at full\n"
+         "resolution instead of the game's low setting. Scenes made without them stay without:\n"
+         "turning them on there breaks the picture.");
+    bool taa = g_taa;
+    if (ImGui::Checkbox("Temporal anti-aliasing", &taa)) g_taa = taa, save = true;
+    Help("Uses the TAA built into the game's post-processing instead of its FXAA: steadier edges\n"
+         "and less shimmer on fine detail, a little softer.");
+    bool shafts = g_shaftsHigh;
+    if (ImGui::Checkbox("High-resolution sun shafts", &shafts)) g_shaftsHigh = shafts, save = true;
+    Help("Draws the light shafts at full quality: the game leaves them at its low setting.");
+    {
+        std::lock_guard<std::mutex> lock(g_fxMutex);
+        if (!g_fxStatus.empty()) ImGui::TextDisabled("Effects: %s", g_fxStatus.c_str());
+    }
+
     static bool unlogged = false;
     if (save) {
         SaveSettings();
         unlogged = true;
     }
     if (unlogged && !ImGui::IsAnyItemActive()) {
-        Log("settings: HDR %s, peak %d, paper white %d nits, highlights from %d%%", g_hdrWanted ? "on" : "off", g_hdrPeak,
-            g_hdrPaper, g_hdrStart);
+        Log("settings: HDR %s, peak %d, paper white %d nits, highlights from %d%%; 16x filtering %d, shadow distance %.2fx, "
+            "detail distance %.2fx, sun shadow map %d; AO %d, SSR %d, TAA %d, sun shafts high %d",
+            g_hdrWanted ? "on" : "off", g_hdrPeak, g_hdrPaper, g_hdrStart, g_aniso ? 1 : 0, g_shadowDistMul.load(),
+            g_lodMul.load(), g_sunShadow.load(), g_ao.load(), g_ssr.load(), g_taa ? 1 : 0, g_shaftsHigh ? 1 : 0);
         unlogged = false;
     }
 
@@ -856,10 +1188,19 @@ void DrawPanel() {
         const char* views[] = {"Off", "Tint what counts as UI", "Show what counts as UI"};
         ImGui::Combo("HDR debug view", &g_debugView, views, 3);
         Help("For diagnosing HDR. Tint: pixels kept at paper white as UI turn magenta.\n"
-             "Coverage: the UI layer's alpha as grey levels.");
+             "Show: what counts as UI in white.");
         if (ImGui::Button("Log one frame's drawing")) g_drawLogArmed = true;
         Help("Writes the next frame's render target changes and draw calls on screen-sized targets\n"
              "to " DT_PRODUCT "-draws.txt next to the game's exe.");
+        ImGui::TextDisabled("Main thread: %llu frames (%s)", static_cast<unsigned long long>(il2cpp_main::g_state.calls.load()),
+                            il2cpp_main::Report().c_str());
+        if (ImGui::Button("Log Unity's quality settings")) il2cpp_main::Post(LogQuality);
+        if (ImGui::Button("Write the camera's and effects' settings")) il2cpp_main::Post(LiveDump);
+        Help("Read-only: writes the main camera and the live post-processing and effect objects\n"
+             "with their settings to " DT_PRODUCT "-live.txt next to the game's exe.");
+        if (ImGui::Button("Write the game's settings classes")) RunProbe();
+        Help("Read-only: writes the game's settings classes, their fields and current values\n"
+             "to " DT_PRODUCT "-il2cpp.txt next to the game's exe.");
         ImGui::TextDisabled("Log: " DT_PRODUCT ".log next to the game's exe");
     }
 }
@@ -920,6 +1261,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             reshade::register_overlay(nullptr, &DrawSettings);
             break;
         case DLL_PROCESS_DETACH:
+            il2cpp_main::Uninstall();
             reshade::unregister_addon(module);
             if (g_log) fclose(g_log);
             break;

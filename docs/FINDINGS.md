@@ -11,9 +11,12 @@
 - Post-processing: Unity Post-Processing Stack v1 (colour grading with a user LUT, ACES/Neutral
   tonemapping, eye adaptation, bloom, depth of field, grain, vignette, chromatic aberration, TAA,
   FXAA/SMAA) plus legacy image effects (SunShafts, GlobalFog, CameraMotionBlur).
-- No console variables. Graphics settings would need IL2CPP calls (QualitySettings and the game's
-  profile fields) on the main thread. The prefs file `PrefData.Save` is encrypted; the registry key
+- No console variables: the graphics options go through IL2CPP (see "Graphics" below). The prefs
+  file `PrefData.Save` is encrypted; the registry key
   `HKCU\Software\Square Enix\Life is Strange: Before the Storm` holds only Screenmanager keys.
+- **Deferred shading** (Camera.actualRenderingPath 3; the G-buffer is 4 render targets), so MSAA
+  (QualitySettings.antiAliasing 2) and the pixel light count (8) hardly matter. Main camera: near
+  0.01, far 2500, HDR and depth texture on.
 
 ## The swap chain upgrade
 
@@ -69,3 +72,69 @@ Result (2026-10-28, paper white 203): "Use WASD to walk" and "Announcement" went
 to 203; the tint view marks only the prompts; scene highlights still stretch. Cost: a
 screen-size FP16 copy for each run of two or more draws into H (about three per frame in the
 logged scene, including the transparent pass), plus the pass's own back buffer copy (not measured).
+
+## Graphics: IL2CPP access
+
+`GameAssembly.dll` exports the full IL2CPP API (240 functions, not obfuscated):
+`il2cpp_domain_get_assemblies`, `il2cpp_class_from_name`, field and method reflection,
+`il2cpp_resolve_icall`, GC handles, `il2cpp_thread_attach`/`detach`.
+
+- **Read-only probe** (`src/il2cpp_probe.hpp`, Advanced button): on its own attached thread,
+  writes the settings-related classes (fields, offsets, enum values, method RVAs, static values and
+  singletons) to `BtSTweaks-il2cpp.txt`.
+- **Main thread**: Unity's API (QualitySettings and the rest) must be called there. Unity calls
+  `MonoBehaviour.Update` through the runtime, which reads `MethodInfo::methodPointer` at each
+  call, so pointing that at an add-on function runs it on the main thread. The game has no Unity
+  EventSystem (its UI is NGUI): that hook never fired. Hooked instead (`src/il2cpp_main.hpp`):
+  `SteamManager.Update` and `CriMonoBehaviourManager.Update` (once per frame), NGUI's
+  `UICamera.Update` (3 per frame). The work runs once per frame, whichever comes first.
+- **Live dump** (Advanced button): `Object.FindObjectsOfType(Type)` on the main thread for the
+  camera and effect classes, profiles and their models followed, to `BtSTweaks-live.txt`.
+
+## The game's settings
+
+- `DawnSettingsManager.RenderSettingsManager`: quality levels Low, Medium, High, "Hella", Custom;
+  keys for resolution, display mode, vsync, MSAA, FXAA, LOD, texture, effects and shadow quality,
+  stored in `IdolPrefs` (float and string dictionaries).
+- `IMGraphicsSettings.s_imGraphicsSettings` (the player's settings, 2026-10-28): main directional
+  light shadows **High** (2), other lights Very High (3), lower lights Medium (1), sun shafts High
+  (2), effects / shadows / AA Highest (3).
+- Unity QualitySettings in play: level 1, shadows all, resolution Very High, stable fit, **shadow
+  distance 60** in the first scene (100 in the menu: set per scene), 4 cascades, **LOD bias 2**,
+  maximum LOD 0, **anisotropic filtering off** (0), texture limit 0, 8 pixel lights, MSAA 2,
+  soft particles on, realtime reflection probes off, 4 skin weights, vsync 1.
+- `RenderSettings.sun`: the main directional light, shadow resolution tier 2 (High), custom
+  resolution -1 (unset).
+
+Applied (main thread, each frame; a value that differs from what the add-on last set came from the
+game and becomes its new base): shadow distance and LOD bias times the multipliers;
+`anisotropicFiltering` ForceEnable with `Texture.SetGlobalAnisotropicFilteringLimits(16, 16)`
+(back to 9, 16 when off); `Light.shadowCustomResolution` on the sun (4096 or 8192). Read back in
+game: shadow distance 120 (game 60), LOD bias 4 (game 2), filtering 2 (game 0), sun 8192 (game -1);
+F8 restores all four. 16x filtering is clearly visible.
+
+## Post-processing
+
+The game's own branch of Post-Processing Stack v1 (`UnityEngine.PostProcessing`): one
+`PostProcessingBehaviour` on the main camera, profile per scene. Models: debug views, D9 skin
+subsurface scattering, fog, antialiasing, ambient occlusion, screen-space reflections, depth of
+field, colour strokes (light leaks), motion blur, eye adaptation, bloom, colour grading, user LUT,
+chromatic aberration, vignette, volumetric fog. In the profile seen indoors (2026-10-28):
+
+| Model | Game | Option |
+|---|---|---|
+| Ambient occlusion | off; 10 samples, downsampled | 16 samples, full res (where on, or everywhere) |
+| Screen-space reflections | off; reflectionQuality Low (2), 256 iterations | High (0) where the scene has them |
+| Antialiasing | FXAA (method 0, preset 4 Extreme); TAA settings present | TAA (method 1) |
+| Depth of field | on, kernel Small | unchanged (artistic) |
+| Motion blur, eye adaptation, skin SSS, vfog | off | unchanged |
+
+Legacy `SunShafts` on the camera: resolution **Low** (0) in that scene although the game's
+setting is High; the option sets High (2). In other scenes the game sets High itself.
+
+**Screen-space reflections turned on in scenes without them break the picture** (tested): the
+option only raises their resolution where a scene uses them. Ambient occlusion everywhere and TAA
+looked good in testing (contact shadows under cars, bushes and the trailer outdoors).
+
+Writes go to the profile objects (shared assets, in memory only). Each written field keeps the
+game's value, and the objects written to are held with GC handles so their addresses stay valid.
